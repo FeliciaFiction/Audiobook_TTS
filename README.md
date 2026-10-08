@@ -145,12 +145,14 @@ Language is auto-detected from EPUB metadata (OPF `dc:language` tag) with fallba
 
 ## Fallback Routes
 
-If PyTorch XPU encounters issues, the application supports:
+If PyTorch XPU is unavailable, the application automatically falls back to
+CPU synthesis (set `KOKORO_DEVICE=cpu` to force this). Kokoro is small enough
+that CPU synthesis works, just slower.
+
+Two additional routes are planned but **not implemented** (see `STATUS.md`):
 
 1. **OpenVINO**: Subclass KModel, execute via `ov.Core` device "GPU"
 2. **ONNX Runtime**: Use `kokoro-onnx` with OpenVINOExecutionProvider
-
-These are configured automatically when PyTorch XPU fails to initialize.
 
 ## Troubleshooting
 
@@ -199,13 +201,15 @@ See `STATUS.md` for the complete development checklist and `AGENTS.md` for detai
 
 This project uses Kokoro-82M (Apache 2.0 license) and PyTorch. All code in this repository is provided as-is for local, non-commercial use.
 
-## Open Questions
+## Resolved Design Decisions
 
-The following decisions are pending (see AGENTS.md):
-- MP3 output as alternative to M4B
-- Batch parallelism for chapters
-- Japanese/Chinese book support in v1
+- **Default voice**: `bf_isabella` (Isabella, British English), with British G2P
+  automatically selected for English books; default speed 1.0. Both remain
+  configurable per project in the UI.
+- **MP3 output**: Not implemented — M4B only for v1.
+- **Batch parallelism**: Sequential per-chapter generation; sufficient on the
+  B70, where Kokoro synthesis already runs far faster than real-time.
+- **Japanese/Chinese**: Supported via Kokoro lang codes `j` and `z` (requires
+  the misaki extras `misaki[ja]` / `misaki[zh]`).
 
-Resolved: the default voice is `bf_isabella` (Isabella, British English), with
-British G2P automatically selected for English books; the default speed is 1.0.
-Both remain configurable per project in the UI.
+See `AGENTS.md` for the full decision log and technical knowledge base.

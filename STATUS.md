@@ -11,10 +11,10 @@
 - [x] **run-xpu.ps1**: Created Intel XPU run script with `SYCL_CACHE_PERSISTENT=1`
 - [x] **requirements-xpu.txt**: Created requirements file for XPU stack
 - [x] **FFmpeg**: Verified ffmpeg and ffprobe are available on PATH
-- [ ] **Python environment**: Create `venv-xpu` with Python 3.10 (requires: run `./setup-xpu.ps1`)
-- [ ] **XPU stack**: Install `torch==2.7.1+xpu`, `pytorch-triton-xpu==3.3.1`, `intel-sycl-rt==2025.0.5` (requires: run `./setup-xpu.ps1`)
+- [x] **Python environment**: Create `venv-xpu` with Python 3.10 (done via `./setup-xpu.ps1`)
+- [x] **XPU stack**: Install `torch==2.7.1+xpu`, `pytorch-triton-xpu==3.3.1`, `intel-sycl-rt==2025.0.5` (installed and verified on B70)
 - [x] **Core packages**: Install `nicegui==3.18.0`, `kokoro`, `ebooklib`, `beautifulsoup4`, `lxml` (installed in venv-xpu)
-- [ ] **Audio/text packages**: Install `soundfile`, `numpy`, `langdetect` or `lingua` (requires: run `./setup-xpu.ps1`)
+- [x] **Audio/text packages**: Install `soundfile`, `numpy`, `langdetect` or `lingua` (installed in venv-xpu)
 - [x] **.gitignore**: Created .gitignore file
 
 ---
@@ -171,10 +171,10 @@
 ## 🏁 Milestones
 
 - **Milestone 1: Foundation** — ✅ Environment setup scripts, requirements, core Python modules created
-- **Milestone 2: Pipeline** — ✅ Text extraction → normalization → chunking → Kokoro synthesis (code complete, needs testing)
+- **Milestone 2: Pipeline** — ✅ Text extraction → normalization → chunking → Kokoro synthesis (verified in e2e integration test, 2026-10-07)
 - **Milestone 3: GUI Core** — ✅ NiceGUI single-page interface with EPUB upload, voice selection, chapter picker (tested)
-- **Milestone 4: State & Resume** — ✅ Manifest system, atomic writes, resume/append functionality (code complete, needs testing)
-- **Milestone 5: M4B Assembly** — ✅ FFMETADATA generation, ffmpeg encoding, chapter marker embedding (code complete, needs testing)
+- **Milestone 4: State & Resume** — ✅ Manifest system, atomic writes, resume/append functionality (verified in e2e integration test)
+- **Milestone 5: M4B Assembly** — ✅ FFMETADATA generation, ffmpeg encoding, chapter marker embedding (verified with ffprobe)
 - **Milestone 6: Polish** — ✅ Text preview, basic edge cases, validation implemented (real-time streaming not needed per user)
 - **Milestone 7: Fallbacks** — ⏳ OpenVINO and ONNX Runtime fallback paths (planned, not implemented)
 - **Milestone 8: Documentation** — ✅ README created, user guide in README
@@ -211,12 +211,10 @@ Audiobook_TTS/
 
 ## 🚀 Next Steps
 
-1. **Run setup**: Execute `./setup-xpu.ps1` to create venv-xpu and install all dependencies
-2. **Test with sample EPUB**: Use `./run-xpu.ps1` to start the NiceGUI interface
-3. **Verify XPU**: Ensure PyTorch XPU is properly configured on the Intel Arc Pro B70
-4. **Test Kokoro**: Verify Kokoro-82M loads correctly and synthesizes audio
-5. **Complete fallbacks**: Implement OpenVINO and ONNX Runtime fallback paths
-6. **Add tests**: Create unit and integration tests
-7. **Documentation**: Write README.md and user guide
+1. **Text cleanup**: Strip footnotes, publisher boilerplate, "By the same author" pages from chapter text (`epub_parser.py` — open item above)
+2. **Unit tests**: EPUB parsing, text extraction, normalization, chunking
+3. **Player validation**: Verify chapter markers in real players (Apple Books, BookPlayer)
+4. **Listen-through**: User quality review of a generated full book
+5. **Fallbacks**: Implement OpenVINO and ONNX Runtime fallback paths
 
-*Last updated: 2026-10-07 | Source: AGENTS.md | Current status: v1 complete, NiceGUI rewrite done, end-to-end verified on XPU; pending: user listen-through of a real book*
+*Last updated: 2026-10-08 | Source: AGENTS.md | Current status: v1 complete, NiceGUI rewrite done, end-to-end verified on XPU; pending: user listen-through of a real book*
