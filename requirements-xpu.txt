@@ -1,0 +1,21 @@
+# Run Audiobook TTS on Intel XPU (GPU)
+$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$VenvPython = Join-Path $ProjectDir "venv-xpu\Scripts\python.exe"
+
+if (-not (Test-Path $VenvPython)) {
+    Write-Host "ERROR: XPU virtual environment not found. Run setup-xpu.ps1 first." -ForegroundColor Red
+    exit 1
+}
+
+# Use XPU device for Kokoro
+$env:KOKORO_DEVICE = "xpu"
+
+# Keep JIT-compiled SYCL/oneDNN kernels on disk so the first-run compilation
+# penalty is only paid once instead of on every launch.
+$env:SYCL_CACHE_PERSISTENT = "1"
+
+Write-Host "Starting Audiobook TTS on Intel XPU..." -ForegroundColor Cyan
+Write-Host "Open http://localhost:8087 in your browser" -ForegroundColor Green
+
+Set-Location $ProjectDir
+& $VenvPython app.py
