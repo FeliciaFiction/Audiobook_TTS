@@ -12,6 +12,7 @@ Usage:
 
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -34,8 +35,9 @@ from state_manager import StateManager, BookManifest
 
 BOOKS_DIR = "books"
 SAMPLE_RATE = 24000
-DEFAULT_SPEED = 1.0
+DEFAULT_SPEED = 0.85  # slightly slower narration (user preference, 2026-10-08)
 DEFAULT_VOICE = "bf_isabella"  # Isabella, British English
+DEFAULT_FAST_STFT = True  # fast GPU synthesis by default (user-verified: no audible difference)
 INTERCHAPTER_SILENCE_S = 0.75
 
 # Kokoro language codes by ISO 639-1
@@ -250,6 +252,137 @@ def build_m4b_now() -> str:
         return f"Error building M4B: {e}"
 
 
+def _xpu_available() -> bool:
+    try:
+        import torch
+        return torch.xpu.is_available()
+    except Exception:
+        return False
+
+
+def generate_worker_parallel(indices: List[int], n_workers: int) -> str:
+    """Synthesize chapters in N parallel subprocess workers.
+
+    Each worker is a separate python process (synth_worker_proc.py) with
+    its own Kokoro model instance on the XPU; jobs are handed out via a
+    file protocol (see that module). The parent owns the manifest: worker
+    results are applied here, one chapter at a time. Measured on the B70
+    with torch 2.13: N workers ~= N x combined throughput (see AGENTS.md).
+    """
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+
+    m = S.manifest
+    total = len(indices)
+    n_workers = max(1, min(int(n_workers), 10))  # UI allows 1-10; clamp defensively
+
+    # Pre-flight: skip textless chapters (same as sequential), reset done
+    # chapters so a re-run replaces their audio.
+    dispatch = []
+    for idx in indices:
+        chapter = m.chapters[idx]
+        text = S.chapter_texts.get(idx) or sm.load_chapter_text(m, idx)
+        if not text or not text.strip():
+            sm.update_chapter_status(m, idx, "error", 0, "No stored chapter text")
+            log(f"Chapter {idx + 1}: no stored text - open the book's EPUB in step 1 to enable generation")
+            continue
+        if chapter.status == "done":
+            sm.reset_chapter(m, idx)
+        dispatch.append(idx)
+
+    if not dispatch:
+        return "complete"
+
+    jobs_dir = Path(tempfile.mkdtemp(prefix="_jobs_", dir=m.output_dir))
+    workers = []
+    status = "complete"
+    try:
+        for idx in dispatch:
+            (jobs_dir / f"{idx:03d}.job").write_text(str(idx), encoding="utf-8")
+
+        # Workers read voice/speed/lang/fast_stft from the manifest file.
+        save_manifest()
+        worker_script = Path(__file__).parent / "synth_worker_proc.py"
+        manifest_path = Path(m.output_dir) / "manifest.json"
+        env = dict(os.environ)
+        env.setdefault("SYCL_CACHE_PERSISTENT", "1")
+
+        for w in range(min(n_workers, len(dispatch))):
+            log_handle = open(jobs_dir / f"worker{w}.log", "w",
+                              encoding="utf-8", errors="replace")
+            workers.append(subprocess.Popen(
+                [sys.executable, str(worker_script), str(jobs_dir), str(manifest_path)],
+                cwd=str(Path(__file__).parent),
+                stdout=log_handle, stderr=subprocess.STDOUT, env=env))
+
+        S.progress.update(chapter=0, chunks=len(dispatch), chunk=0,
+                           message=f"Parallel: {len(workers)} workers")
+
+        results_seen = 0
+        while True:
+            for rf in sorted(jobs_dir.glob("*.result")):
+                try:
+                    result = json.loads(rf.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                try:
+                    rf.unlink()
+                except OSError:
+                    pass
+                results_seen += 1
+                idx = result["index"]
+                if result["status"] == "done":
+                    sm.update_chapter_status(m, idx, "done", result["duration_ms"])
+                    wall = float(result.get("wall") or 0.0)
+                    audio_s = result["duration_ms"] / 1000
+                    realtime = audio_s / wall if wall else 0
+                    log(f"Chapter {idx + 1} done "
+                        f"({fmt_duration(result['duration_ms'])}, {result.get('chunks', 0)} chunks) "
+                        f"in {wall:.1f}s ({realtime:.0f}x realtime)")
+                elif result["status"] == "stopped":
+                    log(f"Chapter {idx + 1}: stopped by user")
+                    status = "stopped"
+                else:
+                    sm.update_chapter_status(m, idx, "error", 0,
+                                             result.get("error") or "worker error")
+                    log(f"Chapter {idx + 1} failed: {result.get('error')}")
+                S.progress.update(chapter=results_seen)
+
+            if results_seen >= len(dispatch):
+                break
+            if S.stop_event.is_set():
+                (jobs_dir / "stop").touch()
+                status = "stopped"
+            if all(p.poll() is not None for p in workers) \
+                    and not list(jobs_dir.glob("*.job")) \
+                    and not list(jobs_dir.glob("*.result")):
+                break  # workers gone, nothing pending: only orphan claims left
+            time.sleep(0.5)
+
+        # Let workers wind down (stop file or job exhaustion)
+        deadline = time.time() + 120
+        for p in workers:
+            try:
+                p.wait(timeout=max(1.0, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+        # Orphaned claims = a worker died mid-chapter. Reset those chapters
+        # so the next Generate re-does them.
+        for claim in sorted(jobs_dir.glob("*.claim")):
+            idx = int(claim.stem)
+            log(f"Chapter {idx + 1}: worker exited mid-chapter - left pending for retry")
+            sm.update_chapter_status(m, idx, "pending", 0)
+    finally:
+        shutil.rmtree(jobs_dir, ignore_errors=True)
+
+    if S.stop_event.is_set():
+        status = "stopped"
+    return status
+
+
 # =============================================================================
 # UI
 # =============================================================================
@@ -262,6 +395,8 @@ def main_page():
     voice_select = None
     language_select = None
     speed_slider = None
+    fast_switch = None
+    workers_select = None
     output_input = None
     generate_btn = None
     stop_btn = None
@@ -355,6 +490,26 @@ def main_page():
         if S.manifest:
             S.manifest.speed = e.value
             save_manifest()
+
+    def on_fast_stft_change(e):
+        if S.manifest:
+            S.manifest.fast_stft = e.value
+            save_manifest()
+        synthesizer.fast_stft = e.value
+        if e.value:
+            ui.notify('Fast GPU synthesis: roughly 2x faster generation, with '
+                      'subtly different audio. Avoid switching mid-book for '
+                      'the most consistent sound.',
+                      type='warning', position='bottom-right')
+        else:
+            ui.notify('Reference audio mode (slower, original STFT path)',
+                      type='positive', position='bottom-right')
+
+    def on_workers_change(e):
+        if S.manifest:
+            S.manifest.n_workers = int(e.value)
+            save_manifest()
+            ui.notify('Saved', type='positive', position='bottom-right')
 
     def on_output_change(e):
         m = S.manifest
@@ -465,6 +620,9 @@ def main_page():
         voice_select.set_options(options)
         voice_select.set_value(m.voice)
         speed_slider.set_value(m.speed)
+        fast_switch.set_value(bool(getattr(m, "fast_stft", False)))
+        synthesizer.fast_stft = bool(getattr(m, "fast_stft", False))
+        workers_select.set_value(int(getattr(m, "n_workers", 3)))
         output_input.set_value(str(Path(m.m4b_path).parent))
 
         render_chapters.refresh()
@@ -502,14 +660,23 @@ def main_page():
         indices = sorted(S.selected)
         S.stop_event.clear()
         S.generating = True
+        # Follow the project's synthesis mode (set via the GUI switch)
+        synthesizer.fast_stft = bool(getattr(S.manifest, "fast_stft", False))
         generate_btn.disable()
         build_btn.disable()
         S.progress.update(chapter=0, chapters=len(indices), chunk=0, chunks=0,
                            message="Starting...", m4b_message="")
-        log(f"Generating {len(indices)} chapter(s) with voice {S.manifest.voice}")
+        mode = "fast GPU synthesis" if S.manifest.fast_stft else "standard synthesis"
+        n_workers = int(getattr(S.manifest, "n_workers", 1))
+        parallel = n_workers > 1 and REQUESTED_DEVICE == "xpu" and _xpu_available()
+        log(f"Generating {len(indices)} chapter(s) with voice {S.manifest.voice} "
+            f"({mode}" + (f", {n_workers} parallel workers)" if parallel else ")"))
 
         try:
-            result = await run.io_bound(generate_worker, indices)
+            if parallel:
+                result = await run.io_bound(generate_worker_parallel, indices, n_workers)
+            else:
+                result = await run.io_bound(generate_worker, indices)
             generated = any(S.manifest.chapters[i].status == "done" for i in indices)
             if result == "complete" and generated:
                 log("All chapters generated, building audiobook...")
@@ -648,6 +815,19 @@ def main_page():
                             on_change=on_speed_change,
                         ).props('label-always').classes('w-full')
                         ui.label('Speed').classes('text-xs text-gray-500')
+                        fast_switch = ui.switch(
+                            'Fast GPU synthesis (2x faster, slightly different audio)',
+                            value=DEFAULT_FAST_STFT, on_change=on_fast_stft_change,
+                        ).classes('text-sm')
+                        with fast_switch:
+                            ui.tooltip(
+                                'The final audio reconstruction (STFT) normally runs on the '
+                                'CPU because the GPU has no kernel for it, roughly halving '
+                                'speed (~15x vs ~27x realtime on an Arc Pro B70). This switch '
+                                'uses a GPU-native, slightly simplified reconstruction instead. '
+                                'Chapters generated with different settings may sound subtly '
+                                'different from each other.'
+                            )
                     with ui.column().classes('w-80 gap-2'):
                         preview_text = ui.input(
                             value='The quick brown fox jumps over the lazy dog.',
@@ -674,14 +854,28 @@ def main_page():
             # 5. Generate
             with ui.card().classes('w-full'):
                 ui.label('5 · Generate').classes('font-semibold text-lg')
-                with ui.row():
-                    generate_btn = ui.button('Generate selected chapters',
-                                              icon='play_circle', on_click=on_generate) \
-                        .props('color=primary')
-                    stop_btn = ui.button('Stop', icon='stop',
-                                         on_click=on_stop).props('outline color=red')
-                    build_btn = ui.button('Rebuild audiobook', icon='build',
-                                          on_click=on_build).props('outline')
+                with ui.row().classes('w-full items-center gap-4'):
+                    with ui.row().classes('items-center gap-2'):
+                        generate_btn = ui.button('Generate selected chapters',
+                                                  icon='play_circle', on_click=on_generate) \
+                            .props('color=primary')
+                        stop_btn = ui.button('Stop', icon='stop',
+                                             on_click=on_stop).props('outline color=red')
+                        build_btn = ui.button('Rebuild audiobook', icon='build',
+                                              on_click=on_build).props('outline')
+                    workers_select = ui.select(
+                        {1: '1 (sequential)', 2: '2', 3: '3', 4: '4', 5: '5',
+                         6: '6', 7: '7', 8: '8', 9: '9', 10: '10'},
+                        value=7, label='Parallel chapters',
+                        on_change=on_workers_change,
+                    ).classes('w-44').tooltip(
+                        'Chapters are synthesized in parallel worker processes '
+                        '(each with its own model instance on the GPU). Verified '
+                        'near-linear scaling up to 4 workers; beyond that is '
+                        'experimental - each worker needs ~2 GB VRAM and ~3 GB '
+                        'system RAM (this machine: 32 GB VRAM / 64 GB RAM). '
+                        'XPU only.'
+                    )
                 progress_bar = ui.linear_progress(value=0, show_value=False).classes('w-full')
                 progress_label = ui.label('Idle').classes('text-sm text-gray-500')
                 ui.label('Per-chapter WAV files are written as they finish; the M4B is '
@@ -699,7 +893,7 @@ def main_page():
 # =============================================================================
 
 if __name__ in {"__main__", "__mp_main__"}:
-    print(f"Starting Audiobook TTS (device requested: {REQUESTED_DEVICE})")
+    print(f"Starting Audiobook TTS multicore (device requested: {REQUESTED_DEVICE})")
     print(f"Found {len(ALL_VOICES)} voices in the local voice pack")
 
     # Warm up the model and JIT kernels in the background so the first
@@ -710,8 +904,8 @@ if __name__ in {"__main__", "__mp_main__"}:
 
     ui.run(
         host="127.0.0.1",
-        port=8087,
-        title="Audiobook TTS",
+        port=8088,
+        title="Audiobook TTS (multicore)",
         show=True,
         reload=False,
     )

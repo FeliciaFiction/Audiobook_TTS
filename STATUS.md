@@ -218,3 +218,30 @@ Audiobook_TTS/
 5. **Fallbacks**: Implement OpenVINO and ONNX Runtime fallback paths
 
 *Last updated: 2026-10-08 | Source: AGENTS.md | Current status: v1 complete, NiceGUI rewrite done, end-to-end verified on XPU; pending: user listen-through of a real book*
+
+---
+
+## ⚠ Environment state (2026-10-08, evening)
+
+**`venv-xpu` on disk is DAMAGED and must be rebuilt before the app is next
+started.** A 3.12.13 rebuild attempt was launched while the app was still
+running; `setup-xpu.ps1`'s `Remove-Item venv-xpu` partially deleted packages
+before aborting on a file locked by the running server (transformers no
+longer imports; triton is partial). The running server was unaffected
+(everything was in RAM), but a restart will fail until the rebuild.
+
+**Recovery (user action required):**
+1. Stop the app (Stop button, then close the console window).
+2. Run `.\setup-xpu.ps1` — it now resolves the uv-managed **Python 3.12.13**
+   (installed via `uv python install 3.12.13`; patched binary build —
+   python.org stopped shipping 3.12 installers at 3.12.10). Full rebuild
+   takes ~10 min (re-downloads torch XPU wheels).
+3. Run `.\run-xpu.ps1`.
+
+Also changed this session: `epub_parser.py` fixed for Project Gutenberg EPUBs
+(minimal 2-point NCX now falls back to spine; `.pg-boilerplate` no longer
+nukes whole pages; CJK-aware word counts; `ebooklib.ITEM_DOCUMENT` constant
+fix) — verified on pg23910 封神演義: 43 chapters, ~485k words. The broken
+`books/封神演義_by_Xixing_Lu_382127e3` project should be deleted and the EPUB
+re-uploaded. `oud_venv-xpu/` (old 3.10 venv backup) can be deleted after the
+rebuild is verified.

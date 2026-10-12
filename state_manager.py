@@ -14,6 +14,8 @@ Manifest schema:
     "kokoro_lang_code": "a",  # Kokoro language code (a, b, e, f, h, i, j, p, z)
     "voice": "af_heart",
     "speed": 1.0,
+    "fast_stft": true,  # Fast GPU synthesis (approx. STFT; ~2x faster, subtly different audio)
+    "n_workers": 7,  # parallel chapter synthesis workers (XPU only; 1 = sequential)
     "epub_path": "path/to/original.epub",  # Original EPUB, if known
     "output_dir": "absolute/path/to/book-id",
     "m4b_path": "absolute/path/to/output-folder/book.m4b",
@@ -72,6 +74,8 @@ class BookManifest:
     kokoro_lang_code: str = "a"  # Default: American English
     voice: str = "af_heart"
     speed: float = 1.0
+    fast_stft: bool = True  # Fast GPU synthesis (approx. STFT decoder); default ON since 2026-10-08
+    n_workers: int = 7  # parallel chapter workers (XPU only; 1 = sequential; 7 = measured optimal on this B70/64GB machine)
     epub_path: str = ""
     output_dir: str = ""
     m4b_path: str = ""
@@ -92,6 +96,8 @@ class BookManifest:
             "kokoro_lang_code": self.kokoro_lang_code,
             "voice": self.voice,
             "speed": self.speed,
+            "fast_stft": self.fast_stft,
+            "n_workers": self.n_workers,
             "epub_path": self.epub_path,
             "output_dir": self.output_dir,
             "m4b_path": self.m4b_path,
@@ -132,6 +138,8 @@ class BookManifest:
             kokoro_lang_code=data.get("kokoro_lang_code", "a"),
             voice=voice,
             speed=data.get("speed", 1.0),
+            fast_stft=bool(data.get("fast_stft", True)),
+            n_workers=int(data.get("n_workers", 7)),
             epub_path=data.get("epub_path", ""),
             output_dir=data.get("output_dir", ""),
             m4b_path=data.get("m4b_path", ""),
@@ -185,13 +193,14 @@ class StateManager:
         """Get current UTC timestamp in ISO format."""
         return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
-    def create_book(self, title: str, author: str = "", language: str = "", 
-                    kokoro_lang_code: str = "a", voice: str = "af_heart", 
+    def create_book(self, title: str, author: str = "", language: str = "",
+                    kokoro_lang_code: str = "a", voice: str = "af_heart",
                     speed: float = 1.0, epub_path: str = "",
-                    output_folder: str = "") -> BookManifest:
+                    output_folder: str = "", fast_stft: bool = True,
+                    n_workers: int = 7) -> BookManifest:
         """
         Create a new book project with directory structure and manifest.
-        
+
         Args:
             title: Book title
             author: Author name
@@ -202,6 +211,7 @@ class StateManager:
             epub_path: Path to the source EPUB (may be empty)
             output_folder: Folder where the M4B is written (defaults to the
                            project directory)
+            fast_stft: Fast GPU synthesis mode (approximate STFT decoder)
             
         Returns:
             BookManifest for the new project
@@ -232,6 +242,8 @@ class StateManager:
             kokoro_lang_code=kokoro_lang_code,
             voice=voice,
             speed=speed,
+            fast_stft=fast_stft,
+            n_workers=n_workers,
             epub_path=epub_path,
             output_dir=str(output_dir),
             m4b_path=m4b_path,

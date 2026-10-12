@@ -75,30 +75,54 @@ class KokoroSynthesizer:
         self.pipeline = None
         self._loaded_lang = None
         self._available_voices = None
-    
-    def load_pipeline(self, lang_code: str = None) -> None:
+        # Fast STFT mode: use Kokoro's conv-based CustomSTFT decoder
+        # (KModel(disable_complex=True)) instead of torch.stft/istft, which
+        # has no XPU kernel and pays a ~2s per-shape CPU-stft cost per chunk.
+        # Much faster on XPU (no per-shape penalty, and the reference path's
+        # per-chapter cost does not apply); slightly different (approximate)
+        # audio. Default ON since 2026-10-08 (user A/B-listened: no audible
+        # difference).
+        self.fast_stft = True
+        self._loaded_fast_stft = None
+
+    def load_pipeline(self, lang_code: str = None, fast_stft: bool = None) -> None:
         """
         Load Kokoro pipeline for the specified language.
-        
+
         Args:
             lang_code: Language code to load (defaults to self.lang_code)
+            fast_stft: Fast STFT mode (defaults to self.fast_stft). Reloads
+                       the model when it differs from the loaded one.
         """
         if lang_code is None:
             lang_code = self.lang_code
-        
-        # Only reload if language changed
-        if self.pipeline is not None and self._loaded_lang == lang_code:
+        if fast_stft is None:
+            fast_stft = self.fast_stft
+
+        # Only reload if language or fast-STFT mode changed
+        if (self.pipeline is not None and self._loaded_lang == lang_code
+                and self._loaded_fast_stft == fast_stft):
             return
-        
+
         try:
             # Ensure required spaCy models are installed before loading pipeline
             # Kokoro's misaki G2P uses spacy for English text processing
             self._ensure_spacy_models(lang_code)
-            
+
             from kokoro import KPipeline
-            
-            # Load pipeline with specified language
-            self.pipeline = KPipeline(lang_code=lang_code)
+            from kokoro.model import KModel
+
+            # Build the model ourselves so we can select the decoder's STFT
+            # implementation (KPipeline's default is always TorchSTFT).
+            # .eval() is required: KPipeline only calls it on models it
+            # creates itself; without it the LSTMs run in training mode,
+            # which torch 2.13+XPU rejects ("oneDNN LSTM on XPU only supports
+            # inference mode") and which picks slower kernels on 2.7.1.
+            model = KModel(repo_id=self.DEFAULT_REPO_ID,
+                           disable_complex=bool(fast_stft)).eval()
+            self.pipeline = KPipeline(lang_code=lang_code,
+                                       repo_id=self.DEFAULT_REPO_ID,
+                                       model=model)
             
             # Move to device (fall back to CPU if the device is unavailable)
             if self.device == "xpu":
@@ -115,9 +139,11 @@ class KokoroSynthesizer:
                     self.device = "cpu"
             
             self._loaded_lang = lang_code
+            self._loaded_fast_stft = fast_stft
             self._available_voices = None  # Reset cached voices
-            
-            print(f"Kokoro pipeline loaded for language '{lang_code}' on device '{self.device}'")
+
+            print(f"Kokoro pipeline loaded for language '{lang_code}' on device "
+                  f"'{self.device}' (fast_stft={fast_stft})")
             
         except ImportError as e:
             print(f"Error loading Kokoro: {e}")
@@ -379,6 +405,9 @@ class KokoroSynthesizer:
         
         if lang_code and lang_code != self._loaded_lang:
             self.load_pipeline(lang_code)
+
+        if self._loaded_fast_stft != self.fast_stft:
+            self.load_pipeline(lang_code or self._loaded_lang)
         
         # Extract voice name from dict if needed (Gradio dropdown returns dict)
         if isinstance(voice, dict):
@@ -457,6 +486,9 @@ class KokoroSynthesizer:
         
         if lang_code and lang_code != self._loaded_lang:
             self.load_pipeline(lang_code)
+
+        if self._loaded_fast_stft != self.fast_stft:
+            self.load_pipeline(lang_code or self._loaded_lang)
         
         if not voice:
             voices = self.get_available_voices()
@@ -494,6 +526,9 @@ class KokoroSynthesizer:
         if lang_code and lang_code != self._loaded_lang:
             self.load_pipeline(lang_code)
 
+        if self._loaded_fast_stft != self.fast_stft:
+            self.load_pipeline(lang_code or self._loaded_lang)
+
         if isinstance(voice, dict):
             voice = voice.get("value") or voice.get("name")
 
@@ -518,16 +553,28 @@ class KokoroSynthesizer:
         JIT kernel compilation. With SYCL_CACHE_PERSISTENT=1 the compiled
         kernels persist on disk, so this cost is paid once per shape family,
         and later real generations start fast.
+
+        On XPU, both STFT paths are warmed (default and fast_stft) so that
+        toggling the fast mode in the GUI doesn't pay the load/compile penalty
+        mid-session; the pipeline matching self.fast_stft is left loaded.
         """
-        self.load_pipeline(lang_code or self.lang_code)
+        lang_code = lang_code or self.lang_code
         voice = voice or "af_heart"
+        flags = [False]
+        if self.device == "xpu" and torch.xpu.is_available():
+            flags.append(True)
         try:
-            with torch.inference_mode():
-                for text in ("Warm up.", "This second sentence is a little "
-                              "longer, to compile a few more kernels."):
-                    for _ in self.pipeline(text, voice=voice, speed=1.0):
-                        pass
-            print("Kokoro warm-up complete")
+            for fast in flags:
+                self.load_pipeline(lang_code, fast_stft=fast)
+                with torch.inference_mode():
+                    for text in ("Warm up.", "This second sentence is a little "
+                                  "longer, to compile a few more kernels."):
+                        for _ in self.pipeline(text, voice=voice, speed=1.0):
+                            pass
+                print(f"Kokoro warm-up complete (fast_stft={fast})")
+            # Leave the pipeline matching the current setting loaded
+            if self._loaded_fast_stft != self.fast_stft:
+                self.load_pipeline(lang_code, fast_stft=self.fast_stft)
         except Exception as e:
             print(f"Warm-up skipped: {e}")
 

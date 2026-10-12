@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
+import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString, Tag, XMLParsedAsHTMLWarning, Comment
 import lxml
@@ -62,6 +63,9 @@ class EPUBParser:
     REMOVE_TAGS = ['script', 'style', 'noscript', 'head', 'meta', 'link', 'img']
     
     # CSS selectors for elements to remove (footnotes, boilerplate)
+    # NOTE: '.pg-boilerplate' is the Project Gutenberg header/footer/license
+    # wrapper. PG title pages consist *entirely* of that div, so after removal
+    # such documents have no text; the spine fallback skips empty chapters.
     REMOVE_SELECTORS = [
         'footnote',
         '.footnote',
@@ -69,8 +73,7 @@ class EPUBParser:
         '[class*="footnote"]',
         '[class*="note"]',
         'aside',
-        '. boilerplate',  # Common class names
-        '[class*="boilerplate"]',
+        '.pg-boilerplate',
         '[class*="copyright"]',
         '[class*="legal"]',
         '[class*="same-author"]',
@@ -84,6 +87,21 @@ class EPUBParser:
         re.compile(r'\b(table of contents|toc|index)\b', re.IGNORECASE),
         re.compile(r'\b(page \d+|\d+ of \d+)\b', re.IGNORECASE),
     ]
+    
+    # CJK characters (Han, kana, hangul): languages written without spaces,
+    # so whitespace word-splitting counts ~0 words for them
+    CJK_CHAR_PATTERN = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
+    
+    def _count_words(self, text: str) -> int:
+        """Count words: whitespace-delimited for spaced languages, one per
+        CJK character for Chinese/Japanese/Korean."""
+        if not text:
+            return 0
+        cjk = len(self.CJK_CHAR_PATTERN.findall(text))
+        non_cjk_words = sum(
+            1 for w in text.split() if not self.CJK_CHAR_PATTERN.search(w)
+        )
+        return cjk + non_cjk_words
     
     def __init__(self):
         pass
@@ -192,15 +210,22 @@ class EPUBParser:
         1. Try to use NCX TOC (legacy EPUB2)
         2. Try to use nav.xhtml TOC (EPUB3)
         3. Fall back to spine order
+        
+        For Calibre-generated EPUBs with split files (partXXX_split_YYY.html),
+        we need to concatenate text from all split parts of each chapter.
         """
         chapters = []
         
-        # Build mapping of spine IDs to their content
+        # Build mapping of spine IDs to their content and preserve spine order
         # Handle both list (of tuples) and dict spine formats
         spine_id_to_item = {}
+        spine_order = []  # Ordered list of (spine_id, item) tuples
+        
         if isinstance(book.spine, dict):
             # spine is a dict: {spine_id: item}
-            spine_id_to_item = {item_id: item for item_id, item in book.spine.items()}
+            for item_id, item in book.spine.items():
+                spine_id_to_item[item_id] = item
+                spine_order.append((item_id, item))
         elif isinstance(book.spine, list):
             # spine is a list of tuples: [(spine_id, item_or_linear), ...]
             for spine_entry in book.spine:
@@ -211,21 +236,26 @@ class EPUBParser:
                     # In ebooklib, spine entries are (item, is_linear) tuples
                     if isinstance(item_or_linear, str):
                         # It's (spine_id, linear_flag), need to get the actual item
-                        # This shouldn't happen, but handle it
                         item = book.get_item_with_id(spine_id)
                         if item:
                             spine_id_to_item[spine_id] = item
+                            spine_order.append((spine_id, item))
                     elif hasattr(item_or_linear, 'get_type'):
                         # It's the actual item (second element)
                         spine_id_to_item[spine_id] = item_or_linear
+                        spine_order.append((spine_id, item_or_linear))
                     else:
                         # Try to get item by ID
                         item = book.get_item_with_id(spine_id)
                         if item:
                             spine_id_to_item[spine_id] = item
+                            spine_order.append((spine_id, item))
                 else:
                     # Direct item reference
-                    spine_id_to_item[spine_entry] = book.get_item_with_id(spine_entry)
+                    item = book.get_item_with_id(spine_entry)
+                    if item:
+                        spine_id_to_item[spine_entry] = item
+                        spine_order.append((spine_entry, item))
         
         # Try to get TOC from NCX (EPUB2)
         ncx_toc = self._extract_ncx_toc(book)
@@ -240,53 +270,74 @@ class EPUBParser:
             # TOC-based chapter extraction
             for toc_item in toc_items:
                 chapter_info = self._create_chapter_from_toc(
-                    toc_item, spine_id_to_item, len(chapters), extract_text
+                    toc_item, spine_id_to_item, spine_order, len(chapters), extract_text
                 )
                 if chapter_info:
                     chapters.append(chapter_info)
         
-        # If TOC didn't give us chapters, fall back to spine
-        if not chapters and book.spine:
-            # Handle both list and dict spine formats
-            if isinstance(book.spine, dict):
-                spine_items = book.spine.items()
-            elif isinstance(book.spine, list):
-                # Convert list of tuples to (id, item) pairs
-                spine_items = []
-                for entry in book.spine:
-                    if isinstance(entry, tuple) and len(entry) >= 2:
-                        spine_id = entry[0]
-                        item_or_linear = entry[1]
-                        if hasattr(item_or_linear, 'get_type'):
-                            spine_items.append((spine_id, item_or_linear))
-                        else:
-                            item = book.get_item_with_id(spine_id)
-                            if item:
-                                spine_items.append((spine_id, item))
-            else:
-                spine_items = []
+        # A TOC can be far coarser than the spine: Project Gutenberg books
+        # often ship a minimal NCX with just two nav points (title page and
+        # license). If the TOC maps to only a small minority of the spine's
+        # HTML documents, it does not describe the book - discard it and use
+        # the spine so the real content files become chapters.
+        spine_docs = [i for i in spine_id_to_item.values() if i is not None]
+        if chapters and spine_docs:
+            covered_files = {c.file_path for c in chapters}
+            if len(covered_files) < max(2, len(spine_docs) // 2):
+                chapters = []
+        
+        # If TOC didn't give us a usable chapter map, fall back to spine
+        # Group consecutive split files together
+        if not chapters and spine_order:
+            # Process spine in order, grouping split files
+            current_split_base = None
+            current_split_items = []
             
-            for idx, (spine_id, item) in enumerate(spine_items):
-                # Skip non-HTML items (CSS, images, etc.)
-                if not item.get_type() == epub.ITEM_DOCUMENT:
+            for spine_id, item in spine_order:
+                if item.get_type() != ebooklib.ITEM_DOCUMENT:
                     continue
+                
+                file_path = item.get_name()
+                split_base = self._get_split_file_base(file_path)
+                
+                # If we're already collecting split files for this base
+                if split_base == current_split_base:
+                    current_split_items.append(item)
+                else:
+                    # Finish the previous group
+                    if current_split_items:
+                        chapter_info = self._create_chapter_from_spine_items(
+                            current_split_items, len(chapters), extract_text
+                        )
+                        if chapter_info and (not extract_text or chapter_info.content.strip()):
+                            chapters.append(chapter_info)
                     
-                chapter_info = self._create_chapter_from_spine(
-                    item, idx, extract_text
+                    # Start a new group
+                    current_split_base = split_base
+                    current_split_items = [item]
+            
+            # Don't forget the last group
+            if current_split_items:
+                chapter_info = self._create_chapter_from_spine_items(
+                    current_split_items, len(chapters), extract_text
                 )
-                if chapter_info:
+                if chapter_info and (not extract_text or chapter_info.content.strip()):
                     chapters.append(chapter_info)
         
         # If we still have no chapters, try all items
         if not chapters:
             for idx, item in enumerate(book.get_items()):
-                if not item.get_type() == epub.ITEM_DOCUMENT:
+                if item.get_type() != ebooklib.ITEM_DOCUMENT:
                     continue
                 chapter_info = self._create_chapter_from_spine(
-                    item, idx, extract_text
+                    item, len(chapters), extract_text
                 )
-                if chapter_info:
+                if chapter_info and (not extract_text or chapter_info.content.strip()):
                     chapters.append(chapter_info)
+        
+        # Keep indices sequential even when documents were skipped
+        for i, chapter in enumerate(chapters):
+            chapter.index = i
         
         return chapters
     
@@ -354,8 +405,72 @@ class EPUBParser:
         
         return toc_items
     
-    def _create_chapter_from_toc(self, toc_item: Dict, spine_id_to_item: Dict, 
-                                  index: int, extract_text: bool) -> Optional[ChapterInfo]:
+    def _get_split_file_base(self, file_path: str) -> Optional[str]:
+        """
+        Extract the base part number from a Calibre split file path.
+        
+        Calibre splits large HTML files into parts like:
+        - text/part0015_split_000.html
+        - text/part0015_split_001.html
+        - text/part0015_split_002.html
+        
+        Returns the base (e.g., 'text/part0015') or None if not a split file.
+        """
+        # Match pattern: .../partXXXX_split_YYY.html or partXXXX_split_YYY.html
+        import re
+        match = re.search(r'(.*/)?part(\d+)_split_(\d+)(\.html)?$', file_path, re.IGNORECASE)
+        if match:
+            # Return the base path with part number
+            prefix = match.group(1) or ''
+            part_num = match.group(2)
+            return f"{prefix}part{part_num}"
+        return None
+    
+    def _find_all_split_items(self, item: epub.EpubItem, spine_order: List[tuple],
+                               spine_id_to_item: Dict) -> List[epub.EpubItem]:
+        """
+        Find all split file items that belong to the same chapter.
+        
+        For Calibre EPUBs, chapters may be split across multiple files:
+        part0015_split_000.html, part0015_split_001.html, etc.
+        
+        Returns a list of all items that are part of the same split chapter.
+        """
+        items = [item]
+        file_path = item.get_name()
+        base_path = self._get_split_file_base(file_path)
+        
+        if base_path is None:
+            return items
+        
+        # Find the position of the current item in the spine
+        current_idx = -1
+        for idx, (spine_id, spine_item) in enumerate(spine_order):
+            if spine_item.get_name() == file_path:
+                current_idx = idx
+                break
+        
+        if current_idx == -1:
+            return items
+        
+        # Look at subsequent spine items for matching split files
+        for idx in range(current_idx + 1, len(spine_order)):
+            spine_id, spine_item = spine_order[idx]
+            next_path = spine_item.get_name()
+            next_base = self._get_split_file_base(next_path)
+            
+            # If it has the same base, it's part of the same chapter
+            if next_base == base_path:
+                items.append(spine_item)
+            else:
+                # Once we hit a different base, we're done
+                break
+        
+        return items
+    
+    def _create_chapter_from_toc(self, toc_item: Dict, spine_id_to_item: Dict,
+                                  spine_order: List[tuple], index: int, 
+                                  extract_text: bool) -> Optional[ChapterInfo]:
         """Create ChapterInfo from TOC entry by finding matching spine item."""
         src = toc_item.get('src', '')
         title = toc_item.get('title', f"Chapter {index + 1}")
@@ -368,35 +483,50 @@ class EPUBParser:
             src_clean = src.split('#')[0].split('?')[0]
             
             if item_href_clean == src_clean or item_href_clean.endswith(src_clean):
-                return self._create_chapter_from_spine(item, index, extract_text, title)
+                # Found matching item - check for Calibre split files
+                all_items = self._find_all_split_items(item, spine_order, spine_id_to_item)
+                return self._create_chapter_from_spine_items(all_items, index, extract_text, title)
         
         # If we couldn't find a matching spine item, try by path
         for spine_id, item in spine_id_to_item.items():
             if src in item.get_name():
-                return self._create_chapter_from_spine(item, index, extract_text, title)
+                # Found matching item - check for Calibre split files
+                all_items = self._find_all_split_items(item, spine_order, spine_id_to_item)
+                return self._create_chapter_from_spine_items(all_items, index, extract_text, title)
         
         return None
     
     def _create_chapter_from_spine(self, item: epub.EpubItem, index: int, 
                                     extract_text: bool, title: Optional[str] = None) -> ChapterInfo:
         """Create ChapterInfo from spine item."""
-        file_path = item.get_name()
+        # For backward compatibility, delegate to the list version
+        return self._create_chapter_from_spine_items([item], index, extract_text, title)
+    
+    def _create_chapter_from_spine_items(self, items: List[epub.EpubItem], index: int, 
+                                         extract_text: bool, title: Optional[str] = None) -> ChapterInfo:
+        """Create ChapterInfo from a list of spine items (for handling split files)."""
+        # Use the first item's path as the file_path
+        file_path = items[0].get_name() if items else ""
         
         # Default title
         if not title:
             title = f"Chapter {index + 1}"
         
-        # Extract text if requested
+        # Extract text from all items and concatenate
         content = ""
         if extract_text:
-            content = self._extract_text_from_item(item)
+            for item in items:
+                content += self._extract_text_from_item(item)
+                # Add a separator between split parts, but not excessive whitespace
+                if len(content) > 0 and not content.endswith('\n'):
+                    content += ' '
         
         return ChapterInfo(
             index=index,
             title=title,
             file_path=file_path,
             content=content,
-            word_count=len(content.split()),
+            word_count=self._count_words(content),
         )
     
     def _extract_text_from_item(self, item: epub.EpubItem) -> str:

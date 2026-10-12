@@ -54,9 +54,20 @@ feedback (Gradio was judged clunky; see Design decisions).
 
 ## Target environment (verified 2026-10-07)
 
-- Windows, Python 3.10 venv convention (mirror the sibling project
-  `D:\git\Voxtral-AI-Demo-Local-Interface`: `venv-xpu\`, `setup-xpu.ps1`,
-  `run-xpu.ps1` pattern).
+- Windows, Python 3.12 venv convention (updated 2026-10-08): `venv-xpu\`,
+  `setup-xpu.ps1`, `run-xpu.ps1` pattern. The interpreter is the **uv-managed
+  3.12.13** (`uv python install 3.12.13`; setup-xpu.ps1 resolves it via
+  `uv python find 3.12` and falls back to the py launcher). Why 3.12.13 and
+  not the python.org 3.12.10: python.org stopped shipping 3.12 binary
+  installers at 3.12.10 (source-only since), so 3.12.10 misses all later
+  security fixes; Astral's prebuilt 3.12.13 is patched to April 2026 —
+  3.12.14/15 remain source-only. Why not 3.13+: **kokoro 0.9.4 declares
+  Requires-Python >=3.10,<3.13** (verified: `pip install kokoro==0.9.4` on
+  3.13 finds no matching distribution), and the pinned torch==2.7.1+xpu
+  wheels stop at cp313 (3.14/3.15 need newer torch). Revisit when kokoro
+  raises its Python ceiling. The sibling project
+  `D:\git\Voxtral-AI-Demo-Local-Interface` still uses 3.10 — do not mirror
+  it for new venvs.
 - Intel Arc Pro B70, 32 GB VRAM, driver 32.0.101.8804+.
 - Working XPU stack already proven on this machine: `torch==2.7.1+xpu`,
   `pytorch-triton-xpu==3.3.1`, `intel-sycl-rt==2025.0.5` family (see sibling
@@ -195,6 +206,115 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
   - misaki G2P is negligible (~0.02s per 140 words); the forward pass is ~100%
     of synthesis time. CPU activity during generation is the SYCL runtime
     feeding the GPU, not the model running on CPU.
+- **stft/istft XPU fallback (measured 2026-10-08)**: torch 2.7.1+xpu has no
+  XPU kernel for `torch.stft`/`torch.istft`. Kokoro's default decoder path
+  (`disable_complex=False` → `TorchSTFT` in `kokoro/istftnet.py`) calls both
+  once per sentence chunk on XPU-resident tensors, so ATen silently copies
+  to CPU, runs the FFT, and copies back — every chunk. This shows up as the
+  one-time `UserWarning: Aten Op fallback from XPU to CPU ... _VF.stft`
+  at warm-up. Measured cost on the same fixed text, fp32, B70, steady state:
+  default path **14.9x realtime** vs `KModel(disable_complex=True)`
+  (`CustomSTFT`, conv-based, XPU-native) **27.5x realtime** — i.e. the
+  fallback roughly halves throughput. Caveat: `CustomSTFT.inverse` is an
+  explicitly *approximate* iSTFT (no proper COLA/DC-Nyquist handling, see
+  its own comments in `kokoro/custom_stft.py`); its audio diverges from the
+  reference path (time-domain corr 0.93 on a test sentence), so it is NOT a
+  free drop-in switch — chapters synthesized with it would sound slightly
+  different from reference-path chapters. A correct fix would be an
+  XPU-native istft with proper window-sum normalization.
+- **Fast GPU synthesis switch (added 2026-10-08)**: the user A/B-listened to
+  both paths (compare_stft_*.wav, since deleted) and heard no difference, so
+  the GUI now exposes the choice: a switch in the Voice card persists
+  `fast_stft` in the manifest (default **False** = reference TorchSTFT
+  path). `KokoroSynthesizer.fast_stft` mirrors it; `load_pipeline()` now
+  builds `KModel(repo_id, disable_complex=fast_stft)` itself and reloads when
+  the flag changes. `warm_up()` warms both decoder paths on XPU so toggling
+  mid-session doesn't pay a load/JIT penalty. Enabling shows a warning
+  notification about switching mid-book. (See the per-shape bullet below:
+  at real-book scale this switch only helps ~20%, because the per-chunk
+  shape cost dominates.)
+- **CORRECTED AGAIN 2026-10-08 (late): per-shape penalty hits BOTH paths;
+  cross-warming invalidated the "no penalty on fast path" claim.** The
+  per-shape cost lives in the conv stack shared by both STFT paths, so
+  benchmarking the fast path after the default path in the SAME process
+  hides its penalty (the default run already paid it). Clean, one-path-per-
+  process measurements (`.eval()` fixed):
+  - torch 2.7.1+xpu: ~1.9-2.4s per NEW chunk length (small chunks), warm
+    0.25-0.39s (~27x); whole ch. 2 (88s, 5 chunks) ~13s cold / ~3.2s warm.
+  - torch 2.13.0+xpu: ~1.9-2.2s per new small-chunk length (~2.7s per chunk
+    on whole chapters), warm 0.10-0.14s (**76-79x**); whole ch. 2 ~14.5s
+    cold / ~1.2s warm.
+  - The penalty is exact-length granular, per-process (does not survive
+    restart even for the same text; `SYCL_CACHE_PERSISTENT` does not cover
+    it), and every sentence group in a real book is a new length.
+  - **Real-book effective speed is therefore ~9x on EITHER torch version**
+    for ~26s chunks (wall ≈ penalty×n_chunks + audio/warm_x). torch 2.13
+    wins for longer chunks, repeated text, previews, and chapter re-dos;
+    it is a wash at this book's chunk size. The real remaining lever is
+    eliminating the per-shape cost itself (profile a cold call; possible
+    oneDNN knobs or shape bucketing) - not attempted yet.
+  1. A `.eval()` bug: when `load_pipeline()` started building `KModel`
+     itself (for the fast_stft switch), it dropped the `.eval()` that
+     `KPipeline` applies to models it creates. Until fixed the same
+     evening, the model ran in *training* mode — slower LSTM kernels on
+     2.7.1, and a hard crash on torch 2.13 ("oneDNN LSTM on XPU only
+     supports inference mode"). Fixed in `load_pipeline()`. All
+     benchmarks run between the fast_stft change and the fix are suspect.
+  2. Measurement-pollution lessons: repeated-sentence texts keep shapes
+     warm and overstate speed, and running both STFT paths in one process
+     cross-warms them (see above). NOTE: an earlier claim that "two Kokoro
+     processes share the GPU at half speed each" is DISPROVEN on the fixed
+     stack — see the parallel-scaling bullet below.
+- **Parallel chapter workers scale near-linearly (measured 2026-10-08
+  night, torch 2.13, fast path, speed 0.85, real chapters, 16-core CPU)**:
+  synthesizing different chapters in N independent processes
+  simultaneously gives ~N x combined throughput, and each individual
+  chapter even runs FASTER than single-process (the per-shape building is
+  single-threaded per process; multiple processes use more cores while the
+  GPU interleaves their short forward passes):
+    1 worker: ch6+ch7 sequential: 6.4x combined
+    2 workers: 11.8x (both chapters at near-unchanged per-chapter wall)
+    3 workers: 19.7x
+    4 workers: 29.1x (ch6 dropped 99.7s -> 75.1s wall)
+  VRAM: <2 GB per model instance, 4 instances = ~8 GB of 32 GB. Worker
+  pool of 3-4 chapter-level workers is the obvious app feature; chapters
+  are the natural parallel unit (independent WAVs, per-chapter manifest
+  updates, resume stays trivial). Use separate PROCESSES (proven);
+  in-process threads sharing one pipeline are unproven and likely unsafe.
+- **Multicore trial copy (2026-10-08 night)**: the parallel-workers
+  feature is implemented and end-to-end tested in
+  `D:\git\Audiobook_TTS_multicore` (a code copy sharing this project's
+  venv-xpu, own books/, port 8088): `synth_worker_proc.py` subprocess
+  worker with a file-based job protocol, `generate_worker_parallel()` in
+  its app.py, `n_workers` (1-4, default 3) in the manifest + GUI select.
+  Verified: 3 workers on real chapters (correct durations, M4B OK) and
+  mid-run stop (no partial WAV, chapter stays pending). VALIDATED IN REAL
+  USE (same night): full book (58 chapters, 12.6 h audio) at 7 workers -
+  42 chapters in 16 min (~34x effective vs ~9x single-worker); 7 is the
+  optimum on this machine (GPU memory mostly saturated; more risks WDDM
+  VRAM spill). Port back here after real-use validation.
+- **torch 2.13.0+xpu is the main stack since 2026-10-08 (evening).**
+  `setup-xpu.ps1` now installs `torch==2.13.0` from the XPU wheel index —
+  the wheel declares its own Intel runtime deps (mkl 2026.x,
+  intel-openmp 2026.x, tbb, umf, tcmlib, triton-xpu 3.7.x; the package
+  renamed from pytorch-triton-xpu), so the old manually pinned Intel SYCL
+  step is gone. torchaudio/torchvision are not installed (nothing imports
+  them). Qualified end-to-end via `qualify_stack.py` (real book text →
+  fast-path synthesis at speed 0.85 → WAVs → chaptered M4B → ffprobe
+  verification: PASSED). Re-run `qualify_stack.py` after any future pin
+  bump. Throwaway artifacts kept: `setup-torchnew.ps1` / `run-torchnew.ps1`
+  (fresh-venv experiment harness), `bench_shape_cost.py` (per-shape
+  benchmark, one path per process), `qualify_stack.py`. The experiment venv
+  `venv-torchnew` was deleted after the upgrade (rebuildable via script).
+- **Defaults changed 2026-10-08 (user decisions)**: `fast_stft` now defaults
+  to **True** everywhere (manifest dataclass, `create_book`, synthesizer,
+  GUI switch; legacy manifests missing the key also load as True) — the
+  user A/B-listened and heard no quality difference. Default narration
+  speed is **0.85** (`DEFAULT_SPEED` in app.py; per-project speed still
+  persisted in the manifest, existing projects keep their stored 1.0).
+  Note: their Paladin's Faith project's finished chapters were generated
+  at speed 1.0; new chapters at 0.85 will read slower than the existing
+  ones - regenerate (redo selected chapters) if uniform pacing matters.
 - **Env vars to set in the run script** (`run-xpu.ps1`):
   `SYCL_CACHE_PERSISTENT=1` — persists JIT-compiled SYCL/oneDNN kernels on disk
   so the first-run compilation penalty is paid once, not per launch. Verified
@@ -271,10 +391,34 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
 
 ## Gotchas checklist
 
+- **Corrupted config files (fixed 2026-10-08):** `requirements-xpu.txt` had
+  been overwritten with a copy of `run-xpu.ps1`, and `setup-xpu.ps1` contained
+  the requirements list — the two had effectively swapped contents, so
+  `pip install -r requirements-xpu.txt` failed. Both were restored;
+  `requirements-xpu.txt` now pins the exact versions verified in the working
+  venv (kokoro 0.9.4, ebooklib 0.20, beautifulsoup4 4.15.0, lxml 6.1.3,
+  soundfile 0.14.0, numpy 2.2.6, nicegui 3.18.0). The spaCy model is
+  downloaded unpinned (`python -m spacy download en_core_web_sm` — a hard
+  `==3.8.0` pin is rejected by spaCy 3.8.16's downloader). setuptools must be
+  >=70 in the venv
+  (CVE-2024-6345); 65.5.0 shipped with Python 3.10.11 and was upgraded in
+  place on 2026-10-08. Rebuilding the venv with `setup-xpu.ps1` preserves
+  `books/` (projects, manifests, chapter audio) — only `venv-xpu` is deleted.
 - EPUB chapter detection is book-specific and messy: some books put all content
   in one XHTML file, some have per-chapter files, TOC lives in NCX and/or
   nav.xhtml. Detect structure per book and let the user confirm the chapter map
   before synthesizing.
+- **Project Gutenberg EPUBs** (verified 2026-10-08 with pg23910 封神演義): the
+  NCX contains only 2 nav points (title page + license), so TOC-based
+  extraction yields 2 boilerplate chapters and misses every real content file.
+  `_extract_chapters` now discards a TOC that maps to fewer than half of the
+  spine's HTML documents and falls back to the spine; spine documents whose
+  extracted text is empty (covers, pages that are entirely `pg-boilerplate`)
+  are skipped. The ebooklib constant is `ebooklib.ITEM_DOCUMENT` (top-level) —
+  `epub.ITEM_DOCUMENT` does not exist (latent AttributeError that only fired
+  once the spine fallback ran).
+- **CJK word counts**: `len(text.split())` counts ~0 words for Chinese text
+  (no whitespace); `_count_words` counts CJK characters as words.
 - Strip footnotes, publisher boilerplate, and "By the same author" pages, or
   chapters will be polluted. Make the pre-flight text preview a first-class
   GUI step.

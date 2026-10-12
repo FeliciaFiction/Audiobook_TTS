@@ -1,21 +1,38 @@
-# Run Audiobook TTS on Intel XPU (GPU)
-$ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$VenvPython = Join-Path $ProjectDir "venv-xpu\Scripts\python.exe"
+# Application requirements for Audiobook TTS (Intel XPU)
+# Target interpreter: Python 3.11/3.12 (kokoro==0.9.4 requires Python <3.13;
+# torch 2.13 XPU wheels ship cp310-cp312).
+#
+# Install order:
+#   1. PyTorch XPU wheel (see setup-xpu.ps1 step 1):
+#        torch==2.13.0+xpu from https://download.pytorch.org/whl/xpu
+#        (the wheel declares its own Intel runtime dependencies - mkl,
+#        intel-openmp, tbb, umf, tcmlib, triton-xpu - so there is no separate
+#        manually pinned Intel SYCL step anymore)
+#   2. Application requirements below (setup-xpu.ps1 step 2 installs this file)
+#   3. spaCy models (setup-xpu.ps1 step 3 installs the English one)
+#
+# Prerequisites:
+#   - Intel GPU driver installed (Arc Pro B70 driver 32.0.101.8804 or newer)
+#   - Level Zero runtime (ze_loader.dll in System32 - included with Intel GPU driver)
+#
+# Pins below are the versions qualified end-to-end on 2026-10-08
+# (B70, XPU, torch 2.13.0, fast_stft=True, speed 0.85 - full generate + M4B
+# test via qualify_stack.py). Do not bump pins without re-running it.
 
-if (-not (Test-Path $VenvPython)) {
-    Write-Host "ERROR: XPU virtual environment not found. Run setup-xpu.ps1 first." -ForegroundColor Red
-    exit 1
-}
+# --- Application dependencies ---
+nicegui==3.18.0
+kokoro==0.9.4
+misaki[zh]==0.9.4   # Chinese G2P (kokoro lang 'z'); kokoro itself pulls misaki[en]
+ebooklib==0.20
+beautifulsoup4==4.15.0
+lxml==6.1.3
+langdetect==1.0.9
+soundfile==0.14.0
+numpy==2.2.6
 
-# Use XPU device for Kokoro
-$env:KOKORO_DEVICE = "xpu"
-
-# Keep JIT-compiled SYCL/oneDNN kernels on disk so the first-run compilation
-# penalty is only paid once instead of on every launch.
-$env:SYCL_CACHE_PERSISTENT = "1"
-
-Write-Host "Starting Audiobook TTS on Intel XPU..." -ForegroundColor Cyan
-Write-Host "Open http://localhost:8087 in your browser" -ForegroundColor Green
-
-Set-Location $ProjectDir
-& $VenvPython app.py
+# --- spaCy models for Kokoro's misaki G2P (English) ---
+# Install separately after this file (setup-xpu.ps1 step 4 installs the first;
+# unpinned: spaCy's downloader resolves the version matching the installed
+# spaCy - a hard pin failed on spaCy 3.8.16):
+#   python -m spacy download en_core_web_sm
+#   python -m spacy download en_core_web_trf   (optional, heavier)
