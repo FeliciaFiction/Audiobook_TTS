@@ -315,6 +315,27 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
   Note: their Paladin's Faith project's finished chapters were generated
   at speed 1.0; new chapters at 0.85 will read slower than the existing
   ones - regenerate (redo selected chapters) if uniform pacing matters.
+- **Flash Attention / xpu-kernels skill: NOT applicable to Kokoro (investigated
+  2026-10-12).** The HF blog "intel-xpu-kernels-skill" (Xe-Forge) reports up to
+  13.3x on Flash Attention forward on this exact GPU (Arc Pro B70) — but at
+  sequence lengths 2K-16K, batched, where the stock XPU Triton FA kernel
+  collapses. Kokoro's forward contains exactly one attention-bearing
+  component: the PL-BERT (CustomAlbert, 12 layers, hidden 768, 12 heads,
+  max_position_embeddings 512 — so S ≤ 512, batch 1), which transformers 5.19
+  already routes through SDPA. Everything else is LSTM + weight-normed conv
+  stacks (TextEncoder, ProsodyPredictor, iSTFTNet decoder). Measured (fast
+  path, fp32, 510-token synthetic chunk = the maximum possible, ~14 s audio):
+  warm full forward ~465 ms; BERT alone ~21-35 ms (~7 % at the extreme, less
+  on typical chunks); attention is only ~20 % of the BERT's FLOPs at S=510
+  (MLP dominates) → **a hypothetically free attention kernel saves ~1-2 % of
+  warm forward time and 0 % of the per-shape cold penalty** (which lives in
+  the conv stack, see above). Verified with `bench_bert_share.py` (BERT-stub
+  delta measurement; note `KModel.forward` takes a phoneme STRING — passing a
+  token tensor silently produces a 2-token degenerate input, use
+  `forward_with_tokens` for synthetic ids). The xpu-kernels skill itself could
+  in principle be pointed at Kokoro's conv/LSTM ops instead of attention, but
+  it would not touch the per-shape JIT penalty (a compile cost, not a slow
+  kernel) — parallel workers remain the real lever.
 - **Env vars to set in the run script** (`run-xpu.ps1`):
   `SYCL_CACHE_PERSISTENT=1` — persists JIT-compiled SYCL/oneDNN kernels on disk
   so the first-run compilation penalty is paid once, not per launch. Verified
