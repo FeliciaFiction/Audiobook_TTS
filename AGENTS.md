@@ -336,6 +336,35 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
   in principle be pointed at Kokoro's conv/LSTM ops instead of attention, but
   it would not touch the per-shape JIT penalty (a compile cost, not a slow
   kernel) — parallel workers remain the real lever.
+- **External leads for the per-shape penalty (web research 2026-10-12, NOT
+  yet verified locally).** The per-shape cost is oneDNN JIT primitive
+  creation (~300-400 ms per GPU primitive per oneDNN's own numbers, PR
+  oneapi-src/oneDNN#1105); their **persistent cache** (blob to disk, ~2 ms
+  reload) is the direct cure, but PyTorch XPU does not expose it — on
+  Windows oneDNN is embedded in the XPU runtime with no supported runtime
+  interface (pytorch#196231). No env-var fix exists on our stack. Two
+  workable-looking levers, in order:
+  1. `torch.compile(mode="max-autotune", dynamic=True)` on XPU is supported
+     on Windows since torch 2.7. Precedent on THIS exact GPU + TTS:
+     klopstack/xpu_qwen3_tts (B70, inductor max-autotune dynamic=True on a
+     transformer talker + XPUGraph capture of the code predictor → 2.4x
+     realtime; ~16 min autotune cold start amortized by persisting
+     TORCHINDUCTOR_CACHE_DIR). Caveats for Kokoro: LSTMs /
+     pack_padded_sequence cause dynamo graph breaks, so coverage would be
+     partial (conv stacks compile, LSTM sections stay eager); dynamic=True
+     is what would neutralize the per-length penalty for compiled regions.
+  2. XPUGraph capture (torch.xpu.XPUGraph since 2.11; torch.accelerator.Graph
+     in 2.12) removes per-launch overhead — our forward does ~2,100 kernel
+     launches plus ~525 aten::item D2H syncs (profiler run 2026-10-12).
+     BUT: capture is static-shape (per-shape capture still pays the oneDNN
+     JIT once), the .item()s break capture (pack_padded_sequence sorts on
+     CPU, repeat_interleave), and XPU capture has open correctness bugs in
+     vLLM (vllm#54785, vllm#48946). `mode="reduce-overhead"` silently
+     no-ops on XPU even on 2.16 nightly (pytorch#200478); cudagraph-trees
+     enablement for XPU is in flight (pytorch PR #200279). Watch for a
+     future torch where reduce-overhead works on XPU.
+  Next experiment if pursued: extend bench_shape_cost.py with a compiled
+  variant (one path per process) and measure the new-shape penalty.
 - **Env vars to set in the run script** (`run-xpu.ps1`):
   `SYCL_CACHE_PERSISTENT=1` — persists JIT-compiled SYCL/oneDNN kernels on disk
   so the first-run compilation penalty is paid once, not per launch. Verified
