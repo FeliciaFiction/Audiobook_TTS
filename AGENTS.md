@@ -292,7 +292,9 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
   USE (same night): full book (58 chapters, 12.6 h audio) at 7 workers -
   42 chapters in 16 min (~34x effective vs ~9x single-worker); 7 is the
   optimum on this machine (GPU memory mostly saturated; more risks WDDM
-  VRAM spill). Port back here after real-use validation.
+  VRAM spill). Ported back into this repo in commit 883a9ed:
+  `generate_worker_parallel()` + `synth_worker_proc.py`, `n_workers`
+  1-10 (default 3) in the manifest + GUI select.
 - **torch 2.13.0+xpu is the main stack since 2026-10-08 (evening).**
   `setup-xpu.ps1` now installs `torch==2.13.0` from the XPU wheel index —
   the wheel declares its own Intel runtime deps (mkl 2026.x,
@@ -302,10 +304,11 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
   them). Qualified end-to-end via `qualify_stack.py` (real book text →
   fast-path synthesis at speed 0.85 → WAVs → chaptered M4B → ffprobe
   verification: PASSED). Re-run `qualify_stack.py` after any future pin
-  bump. Throwaway artifacts kept: `setup-torchnew.ps1` / `run-torchnew.ps1`
-  (fresh-venv experiment harness), `bench_shape_cost.py` (per-shape
-  benchmark, one path per process), `qualify_stack.py`. The experiment venv
-  `venv-torchnew` was deleted after the upgrade (rebuildable via script).
+  bump. Kept in the tree: `qualify_stack.py`. The other throwaway
+  experiment artifacts (`setup-torchnew.ps1` / `run-torchnew.ps1`
+  fresh-venv harness, `bench_shape_cost.py`, `bench_bert_share.py`)
+  were removed from the tree on 2026-10-13 and live in git history.
+  The experiment venv `venv-torchnew` was deleted after the upgrade.
 - **Defaults changed 2026-10-08 (user decisions)**: `fast_stft` now defaults
   to **True** everywhere (manifest dataclass, `create_book`, synthesizer,
   GUI switch; legacy manifests missing the key also load as True) — the
@@ -363,8 +366,10 @@ tooling — ffmpeg alone can produce chaptered M4B, see knowledge base below).
      no-ops on XPU even on 2.16 nightly (pytorch#200478); cudagraph-trees
      enablement for XPU is in flight (pytorch PR #200279). Watch for a
      future torch where reduce-overhead works on XPU.
-  Next experiment if pursued: extend bench_shape_cost.py with a compiled
-  variant (one path per process) and measure the new-shape penalty.
+  Next experiment if pursued: recreate the per-shape benchmark
+  (`bench_shape_cost.py`, removed 2026-10-13 - recover from git history)
+  with a compiled variant (one path per process) and measure the
+  new-shape penalty.
 - **Env vars to set in the run script** (`run-xpu.ps1`):
   `SYCL_CACHE_PERSISTENT=1` — persists JIT-compiled SYCL/oneDNN kernels on disk
   so the first-run compilation penalty is paid once, not per launch. Verified

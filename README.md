@@ -20,7 +20,7 @@ A local GUI application that converts EPUB e-books into M4B audiobooks with embe
 - Windows OS
 
 ### Software
-- Python 3.10+
+- Python 3.12 (uv-managed 3.12.13 recommended; kokoro 0.9.4 requires <3.13)
 - FFmpeg and FFprobe on PATH
 
 ## Quick Start
@@ -34,9 +34,8 @@ Run the setup script in PowerShell:
 ```
 
 This will:
-- Create a `venv-xpu` virtual environment with Python 3.10
-- Install Intel SYCL runtime packages
-- Install PyTorch XPU wheels
+- Create a `venv-xpu` virtual environment with Python 3.12 (uv-managed)
+- Install PyTorch XPU wheels (torch 2.13.0; Intel runtime dependencies are resolved from the wheel itself)
 - Install all application dependencies (Kokoro, NiceGUI, ebooklib, etc.)
 
 **Note**: This requires an active internet connection and may take several minutes.
@@ -102,8 +101,10 @@ Audiobook_TTS/
 ├── epub_parser.py       # EPUB ingestion and chapter extraction
 ├── text_processing.py    # Text normalization and chunking
 ├── kokoro_synth.py       # Kokoro-82M synthesis with XPU support
+├── synth_worker_proc.py  # Subprocess chapter worker (parallel generation)
 ├── m4b_assembler.py      # M4B assembly with ffmpeg and chapter markers
 ├── state_manager.py      # State persistence and manifest management
+├── qualify_stack.py      # End-to-end stack qualification check
 ├── setup-xpu.ps1         # Intel XPU environment setup script
 ├── run-xpu.ps1           # Intel XPU application launch script
 ├── requirements-xpu.txt  # XPU dependencies list
@@ -189,9 +190,14 @@ Or download from https://ffmpeg.org and add to PATH.
 ## Performance Notes
 
 - Kokoro-82M uses <2 GB VRAM on Intel Arc Pro B70
-- Synthesis is deterministic: same (text, voice, speed) produces identical audio
+- Warm synthesis runs at ~76-79x realtime per chapter on the XPU stack (torch 2.13)
+- The dominant real-book cost is a per-chunk-length oneDNN JIT warm-up
+  (~2-2.7 s per new sentence-group length, per process); parallel chapter
+  workers (default 3, up to 10) overlap this cost and were measured at
+  ~34x effective realtime on a full 12.6 h book at 7 workers
 - First run includes SYCL kernel compilation (persisted via `SYCL_CACHE_PERSISTENT=1`)
 - Subsequent runs are significantly faster
+- Output is deterministic in structure (no sampling loop; predicted durations are identical per (text, voice, speed)), but sample-level audio can vary slightly between runs on XPU with the fast STFT path (default)
 
 ## Development
 
@@ -204,11 +210,12 @@ This project uses Kokoro-82M (Apache 2.0 license) and PyTorch. All code in this 
 ## Resolved Design Decisions
 
 - **Default voice**: `bf_isabella` (Isabella, British English), with British G2P
-  automatically selected for English books; default speed 1.0. Both remain
-  configurable per project in the UI.
+  automatically selected for English books; default narration speed 0.85. Both
+  remain configurable per project in the UI.
 - **MP3 output**: Not implemented — M4B only for v1.
-- **Batch parallelism**: Sequential per-chapter generation; sufficient on the
-  B70, where Kokoro synthesis already runs far faster than real-time.
+- **Batch parallelism**: Parallel chapter workers (separate subprocesses,
+  1-10 workers, default 3; sequential when set to 1). Measured near-linear
+  scaling on the B70 — see Performance Notes.
 - **Japanese/Chinese**: Supported via Kokoro lang codes `j` and `z` (requires
   the misaki extras `misaki[ja]` / `misaki[zh]`).
 

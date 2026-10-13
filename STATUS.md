@@ -11,7 +11,7 @@
 - [x] **run-xpu.ps1**: Created Intel XPU run script with `SYCL_CACHE_PERSISTENT=1`
 - [x] **requirements-xpu.txt**: Created requirements file for XPU stack
 - [x] **FFmpeg**: Verified ffmpeg and ffprobe are available on PATH
-- [x] **Python environment**: Create `venv-xpu` with Python 3.10 (done via `./setup-xpu.ps1`)
+- [x] **Python environment**: Create `venv-xpu` with Python 3.12 (done via `./setup-xpu.ps1`; uv-managed 3.12.13)
 - [x] **XPU stack**: Install `torch==2.7.1+xpu`, `pytorch-triton-xpu==3.3.1`, `intel-sycl-rt==2025.0.5` (installed and verified on B70)
 - [x] **Core packages**: Install `nicegui==3.18.0`, `kokoro`, `ebooklib`, `beautifulsoup4`, `lxml` (installed in venv-xpu)
 - [x] **Audio/text packages**: Install `soundfile`, `numpy`, `langdetect` or `lingua` (installed in venv-xpu)
@@ -159,9 +159,9 @@
 - [x] **README.md**: Project overview, setup instructions, usage guide
 - [x] **Open questions resolution**: Documented in README - user can configure per-project:
   - Default voice: `bf_isabella` (Isabella, British English; resolved 2026-10-07)
-  - Default speed: 1.0 (configurable)
+  - Default speed: 0.85 (configurable)
   - MP3 alternative: Not implemented (M4B only for v1)
-  - Batch parallelism: Sequential per-chapter (sufficient on B70 XPU)
+  - Batch parallelism: Parallel chapter workers, 1-10 subprocesses (default 3)
   - Japanese/Chinese: Supported via Kokoro lang codes `j` and `z` (requires misaki extras)
 - [x] **User guide**: Step-by-step workflow in README
 - [x] **Troubleshooting**: Common issues section in README
